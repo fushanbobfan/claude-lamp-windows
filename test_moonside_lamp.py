@@ -270,7 +270,8 @@ class NightHours(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.quiet_file = self.root / "quiet.json"
         for name, value in (("QUIET_FILE", self.quiet_file), ("STATUS_FILE", self.root / "status.json"),
-                            ("PAUSE_FLAG", self.root / "paused"), ("STATE", self.root)):
+                            ("PAUSE_FLAG", self.root / "paused"), ("NIGHT_HOLD", self.root / "night-hold"),
+                            ("STATE", self.root)):
             patcher = mock.patch.object(ml, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -342,6 +343,7 @@ class NightHours(unittest.IsolatedAsyncioTestCase):
     def test_input_clock_reads_this_session(self):
         self.assertGreaterEqual(ml.seconds_since_input(), 0.0)
         self.assertLess(ml.seconds_since_input(), 50 * 86400)
+        self.assertIsInstance(ml.last_input_tick(), int)
 
     async def daemon_after_a_moment(self):
         daemon = ml.Daemon(dry_run=True)
@@ -376,6 +378,126 @@ class NightHours(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(ml, "seconds_since_input", lambda: 0.0):
             self.assertTrue((await self.daemon_after_a_moment()).paused)
 
+    def test_after_the_hours_a_dark_lamp_waits_for_the_first_input(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertTrue(quiet.dark_now(120))
+            self.assertTrue(quiet.dark_now(600))  # 10:00 and nobody back yet
+            self.assertTrue(ml.QuietHours().dark_now(720))  # a restarted daemon keeps waiting
+        with mock.patch.object(ml, "seconds_since_input", lambda: 0.0), \
+                mock.patch.object(ml, "last_input_tick", lambda: 2000):
+            self.assertFalse(quiet.dark_now(725))  # the first touch
+        with mock.patch.object(ml, "seconds_since_input", lambda: 30 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 2000):
+            self.assertFalse(quiet.dark_now(760))  # outside the hours an idle computer keeps the lamp
+
+    def test_a_lamp_lit_when_the_hours_end_stays_lit(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 60.0), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertFalse(quiet.dark_now(599))
+            self.assertFalse(quiet.dark_now(600))
+
+    def test_lamp_on_ends_the_wait_for_input(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000), mock.patch("builtins.print"):
+            self.assertTrue(quiet.dark_now(120))
+            self.assertTrue(quiet.dark_now(600))
+            self.assertEqual(ml.main(["on"]), 0)
+            self.assertFalse(quiet.dark_now(601))
+
+    def test_a_restart_before_the_hours_end_keeps_the_wait(self):
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertTrue(ml.QuietHours().dark_now(599))
+            self.assertTrue(ml.QuietHours().dark_now(600))  # a new daemon took over across 10:00
+
+    def test_lamp_on_right_after_the_hours_is_not_undone(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000), mock.patch("builtins.print"):
+            self.assertTrue(quiet.dark_now(599))
+            self.assertEqual(ml.main(["on"]), 0)  # past 10:00, before the daemon looks again
+            self.assertFalse(quiet.dark_now(600))
+
+    def test_unknown_input_keeps_the_wait(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertTrue(quiet.dark_now(599))
+        with mock.patch.object(ml, "last_input_tick", lambda: None):
+            self.assertTrue(quiet.dark_now(600))
+            self.assertTrue(quiet.dark_now(601))
+        with mock.patch.object(ml, "last_input_tick", lambda: 2000):
+            self.assertFalse(quiet.dark_now(602))
+
+    def test_an_input_query_failure_inside_the_hours_keeps_the_wait(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertTrue(quiet.dark_now(598))
+        with mock.patch.object(ml, "seconds_since_input", lambda: 0.0), \
+                mock.patch.object(ml, "last_input_tick", lambda: None):  # how a failed Windows query looks
+            self.assertTrue(quiet.dark_now(599))
+        with mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            self.assertTrue(quiet.dark_now(600))
+
+    def test_a_hold_file_that_cannot_be_read_keeps_the_wait(self):
+        ml.NIGHT_HOLD.mkdir()  # there, but reading it fails
+        with mock.patch.object(ml, "last_input_tick", lambda: 2000):
+            self.assertTrue(ml.QuietHours().dark_now(600))
+
+    def test_status_names_the_wait_only_when_there_is_one(self):
+        said = lambda shown: any("dark until the first input" in str(c.args[0]) for c in shown.call_args_list if c.args)
+        with mock.patch("builtins.print") as shown:
+            ml.NIGHT_HOLD.write_text("not a tick", encoding="utf-8")
+            ml.main(["status"])
+            self.assertFalse(said(shown))
+            ml.NIGHT_HOLD.write_text("1000", encoding="utf-8")
+            ml.main(["status"])
+            self.assertTrue(said(shown))
+
+    async def test_the_daemon_keeps_a_waiting_lamp_released_until_input(self):
+        ml.NIGHT_HOLD.write_text("1000", encoding="utf-8")
+        with mock.patch.object(ml, "last_input_tick", lambda: 1000):
+            daemon = await self.daemon_after_a_moment()
+        self.assertTrue(daemon.paused)
+        with mock.patch.object(ml, "last_input_tick", lambda: 2000):
+            try:
+                await asyncio.wait_for(daemon.watch_sessions(), 0.5)
+            except asyncio.TimeoutError:
+                pass
+        self.assertFalse(daemon.paused)
+        self.assertEqual(daemon.target, "input")
+
+    def test_changing_the_hours_ends_the_wait(self):
+        quiet = ml.QuietHours()
+        self.write("01:00", "10:00")
+        with mock.patch.object(ml, "seconds_since_input", lambda: 15 * 60), \
+                mock.patch.object(ml, "last_input_tick", lambda: 1000), mock.patch("builtins.print"):
+            self.assertTrue(quiet.dark_now(120))
+            self.assertEqual(ml.main(["quiet", "5:00", "6:00"]), 0)
+            os.utime(self.quiet_file, (5, 5))  # two writes in one clock tick can share a time stamp
+            self.assertFalse(quiet.dark_now(121))  # 02:01 lies outside the new hours
+            self.write("01:00", "10:00")
+            self.assertTrue(quiet.dark_now(120))
+            self.assertEqual(ml.main(["quiet", "off"]), 0)
+            self.assertFalse(quiet.dark_now(121))
+            self.write("01:00", "10:00")
+            self.assertTrue(quiet.dark_now(120))
+            self.assertTrue(quiet.dark_now(600))
+            self.assertEqual(ml.main(["quiet", "1:00", "9:00"]), 0)
+            self.assertFalse(quiet.dark_now(601))
+
     def test_a_bad_idle_value_ignores_the_file(self):
         self.write_around_now(idle_minutes="soon")
         self.assertFalse(ml.QuietHours().active())
@@ -396,7 +518,8 @@ class LampDriving(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(shutil.rmtree, self.root)
         for name, value in (("QUIET_FILE", self.root / "quiet.json"), ("STATUS_FILE", self.root / "status.json"),
                             ("PAUSE_FLAG", self.root / "paused"), ("LAMP_FILE", self.root / "lamp.json"),
-                            ("LOG_FILE", self.root / "lamp.log"), ("STATE", self.root)):
+                            ("NIGHT_HOLD", self.root / "night-hold"), ("LOG_FILE", self.root / "lamp.log"),
+                            ("STATE", self.root)):
             patcher = mock.patch.object(ml, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -559,9 +682,10 @@ class FallbackToDocumentedCommand(unittest.IsolatedAsyncioTestCase):
         self.saved = ml.STATUS_FILE, ml.PAUSE_FLAG
         ml.STATUS_FILE, ml.PAUSE_FLAG = self.root / "status.json", self.root / "paused"
         self.addCleanup(lambda: (setattr(ml, "STATUS_FILE", self.saved[0]), setattr(ml, "PAUSE_FLAG", self.saved[1])))
-        patcher = mock.patch.object(ml, "QUIET_FILE", self.root / "quiet.json")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (("QUIET_FILE", self.root / "quiet.json"), ("NIGHT_HOLD", self.root / "night-hold")):
+            patcher = mock.patch.object(ml, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def watch(self, daemon, seconds):
         try:

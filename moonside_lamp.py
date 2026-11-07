@@ -13,7 +13,8 @@ status field, the daemon reads the documented `claude agents --json` instead.
 Protocol: https://developer.moonside.design (plain ASCII written to a BLE characteristic).
 
 Inside the night hours set with `quiet`, once nobody has touched the computer for 15 minutes,
-the lamp is dark and released, pink included; any input brings it back.
+the lamp is dark and released, pink included; any input brings it back. If the hours end with
+the lamp dark, it stays dark until that input or `on`.
 
 Commands: run, status, scan, off, on, quiet, pin, demo.
 """
@@ -42,6 +43,7 @@ STATUS_FILE = STATE / "status.json"
 LAMP_FILE = STATE / "lamp.json"
 LOG_FILE = STATE / "lamp.log"
 QUIET_FILE = STATE / "quiet.json"
+NIGHT_HOLD = STATE / "night-hold"  # last input tick while night hours keep the lamp dark; after them it waits for input
 
 WRITE_CHAR = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 READ_CHAR = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -324,6 +326,14 @@ def seconds_since_input() -> float:
     return ((_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
 
 
+def last_input_tick() -> int | None:
+    """Tick count of the last keyboard or mouse input in this logon session; it changes only on input."""
+    info = _LastInputInfo(ctypes.sizeof(_LastInputInfo), 0)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+    return int(info.dwTime)
+
+
 class QuietHours:
     """The window in state/quiet.json; the file is parsed again only when it changes."""
 
@@ -333,6 +343,8 @@ class QuietHours:
         self.window: tuple[int, int] | None = None
         self.label = ""
         self.idle_minutes = IDLE_MINUTES
+        self.announced = False  # the wait after the window has been logged
+        self.write_failed = False
 
     def active(self, minute: int | None = None) -> bool:
         try:
@@ -357,9 +369,68 @@ class QuietHours:
             minute = now.tm_hour * 60 + now.tm_min
         return in_window(minute, *self.window)
 
-    def dark_now(self) -> bool:
-        """Inside the window and nobody has touched the computer for idle_minutes."""
-        return self.active() and seconds_since_input() >= self.idle_minutes * 60
+    def dark_now(self, minute: int | None = None) -> bool:
+        """Inside the window once nobody has touched the computer for idle_minutes. A lamp that goes
+        dark there stays dark after the window until the first input, `on`, or new hours."""
+        if self.active(minute):
+            self.announced = False
+            tick = last_input_tick()
+            if tick is None:  # input unreadable: keep a saved wait, otherwise stay lit as before
+                return hold_exists()
+            if seconds_since_input() >= self.idle_minutes * 60:
+                self.hold(tick)
+                return True
+            end_hold()
+            return False
+        try:
+            held = read_hold()
+        except OSError:  # the file is there but cannot be read just now
+            return True
+        if held is None:
+            return False
+        tick = last_input_tick()
+        if tick is not None and tick != held:
+            end_hold()
+            return False
+        if not self.announced:  # no input since the lamp went dark, or none readable
+            log.info("night hours over; dark until the first input")
+            self.announced = True
+        return True
+
+    def hold(self, tick: int) -> None:
+        """Keeps the last input tick on disk while the lamp is dark, so a restart and `on` both see it."""
+        try:
+            if read_hold() == tick:
+                return
+            NIGHT_HOLD.write_text(str(tick), encoding="utf-8")
+            self.write_failed = False
+        except OSError as e:
+            if not self.write_failed:
+                log.warning("night hold not saved: %s", e)
+            self.write_failed = True
+
+
+def read_hold() -> int | None:
+    """The saved tick, or None when no usable wait is saved; other read errors propagate."""
+    try:
+        return int(NIGHT_HOLD.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def hold_exists() -> bool:
+    """A wait is saved, or its file is there but cannot be read just now."""
+    try:
+        return read_hold() is not None
+    except OSError:
+        return True
+
+
+def end_hold() -> None:
+    try:
+        NIGHT_HOLD.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- the lamp
@@ -636,6 +707,8 @@ def cmd_status(_args) -> int:
         print("daemon: no status file yet")
     print("paused:", PAUSE_FLAG.exists())
     print(night_hours_line())
+    if hold_exists() and not QuietHours().active():
+        print("night hours over: dark until the first input, or `on`")
     return 0
 
 
@@ -663,6 +736,7 @@ def cmd_off(_args) -> int:
 
 def cmd_on(_args) -> int:
     PAUSE_FLAG.unlink(missing_ok=True)
+    NIGHT_HOLD.unlink(missing_ok=True)  # also ends the wait for the first input after night hours
     print("lamp follows Claude Code again")
     print(night_hours_line())
     return 0
@@ -674,6 +748,7 @@ def night_hours_line() -> str:
     if not quiet.label:
         return "night hours: none"
     rule = f"dark after {quiet.idle_minutes:g} min without input" if quiet.idle_minutes else "dark throughout"
+    rule += ", and after them until the first input"
     return f"night hours: {quiet.label}, {rule}" + (" (in them now)" if active else "")
 
 
@@ -684,6 +759,7 @@ def cmd_quiet(args) -> int:
         return 0
     if args.start == "off":
         QUIET_FILE.unlink(missing_ok=True)
+        NIGHT_HOLD.unlink(missing_ok=True)
         print("no night hours: the lamp follows Claude Code all day")
         return 0
     try:
@@ -694,6 +770,7 @@ def cmd_quiet(args) -> int:
     label = {"from": f"{start // 60:02d}:{start % 60:02d}", "to": f"{end // 60:02d}:{end % 60:02d}",
              "idle_minutes": args.idle}
     QUIET_FILE.write_text(json.dumps(label), encoding="utf-8")
+    NIGHT_HOLD.unlink(missing_ok=True)  # new hours also end a wait left by the old ones
     print(night_hours_line())
     return 0
 

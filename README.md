@@ -9,7 +9,7 @@ A [Moonside](https://developer.moonside.design/) lamp as a status light for [Cla
 | Strong pink | At least one session is blocked on you: a permission prompt or a question prompt |
 | Slow blue wave | At least one session is working, and none is blocked |
 | Soft warm white | Nothing is running |
-| Dark | Nothing has run for 30 minutes; the lamp lights again as soon as a session starts working or needs you |
+| Dark | Nothing has run for 30 minutes, and the lamp lights again as soon as a session starts working or needs you; or night hours keep it dark until someone touches the computer (see `quiet` below) |
 
 This is an unofficial project with no connection to Moonside or Anthropic.
 
@@ -20,7 +20,7 @@ This is an unofficial project with no connection to Moonside or Anthropic.
 - **Windows.** The daemon runs from a per-user task in Windows Task Scheduler.
 - **No hooks.** claude-lamp registers Claude Code hooks, including one before each tool call. This project reads the status files Claude Code already keeps in `~/.claude/sessions`, so `settings.json` stays as it is, nothing extra runs inside your sessions, and a lamp fault cannot reach them.
 - **Many sessions at once.** The lamp shows the most urgent state across all sessions: blocked over working over idle.
-- **Night hours.** An optional time window in which the lamp goes dark once nobody is using the computer.
+- **Night hours.** An optional time window in which the lamp goes dark once nobody is using the computer and stays dark until someone touches it again.
 
 ## Setup
 
@@ -64,8 +64,8 @@ Run each command as `.venv\Scripts\python moonside_lamp.py <command>`.
 |---|---|
 | `status` | Names the sessions that are blocked or working, and shows what the lamp is doing |
 | `off` | Turns the lamp dark and disconnects from it, so the phone app can connect; holds across restarts until `on` |
-| `on` | Follows Claude Code again |
-| `quiet 01:00 10:00` | Sets night hours, in local time: inside them, after 15 minutes without keyboard or mouse input, the lamp goes dark, pink included, and the daemon disconnects from it; any input brings it back. Add `--idle 0` to keep it dark for the whole window, in use or not. `quiet off` clears them |
+| `on` | Follows Claude Code again; once the night hours are over, this also lights a lamp they left dark |
+| `quiet 01:00 10:00` | Sets night hours, in local time: inside them, after 15 minutes without keyboard or mouse input, the lamp goes dark, pink included, and the daemon disconnects from it; any input brings it back. If the window ends with the lamp dark, it stays dark until the first input, `on`, or new hours set with `quiet`. Add `--idle 0` to keep it dark for the whole window, in use or not. `quiet off` clears them |
 | `pin <address>` | Uses that lamp only, with the address `scan` shows, from the daemon's next connection; restart the task to apply it now. `pin off` goes back to the strongest Bluetooth signal, the default |
 | `demo "<command>" ...` | Shows lamp commands of your choice, 8 seconds each; run `off` first |
 
